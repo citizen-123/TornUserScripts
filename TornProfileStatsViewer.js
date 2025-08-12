@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Profile Stats Viewer
 // @namespace    master.torn.stats.viewer
-// @version      1.5.1
+// @version      1.5.2
 // @description  Duplicates the existing stats button on Torn profile pages and adds API-powered stats overlay with searchable, nested, expandable personal statistics.
 // @author       VinPetrol [2060292]
 // @match        https://www.torn.com/profiles.php*
@@ -462,55 +462,7 @@
   }
   
   function escapeRegex(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\  function renderStatsData(overlay, data) {
-    const content = overlay.querySelector('.tm-stats-content');
-    
-    // Create a more organized display of the stats
-    let html = '<div class="tm-stats-categories">';
-    
-    // Group and organize the stats by category
-    const categories = {};
-    
-    for (const [key, value] of Object.entries(data)) {
-      if (typeof value === 'object' && value !== null) {
-        // This is a category with nested stats
-        categories[key] = value;
-      } else {
-        // This is a standalone stat - put in "General" category
-        if (!categories['General']) categories['General'] = {};
-        categories['General'][key] = value;
-      }
-    }
-    
-    // Render each category
-    for (const [categoryName, categoryData] of Object.entries(categories)) {
-      html += renderCategory(categoryName, categoryData, 'category');
-    }
-    
-    html += '</div>';
-    
-    // Add summary info
-    const totalCategories = Object.keys(categories).length;
-    const totalStats = countTotalStats(categories);
-    
-    html += `
-      <div class="tm-stats-summary">
-        <div class="tm-stats-summary-item">
-          <span class="tm-stats-summary-label">Categories:</span>
-          <span class="tm-stats-summary-value">${totalCategories}</span>
-        </div>
-        <div class="tm-stats-summary-item">
-          <span class="tm-stats-summary-label">Total Stats:</span>
-          <span class="tm-stats-summary-value">${totalStats}</span>
-        </div>
-      </div>
-    `;
-    
-    content.innerHTML = html;
-    
-    // Add toggle functionality for all expandable sections
-    content.addEventListener('click', handleToggleClick);
-  }');
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
   
   function renderCategory(name, data, level = 'category', depth = 0, parentPath = []) {
