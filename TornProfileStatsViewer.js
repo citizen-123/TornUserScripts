@@ -11,8 +11,8 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
-// @updateURL    ""
-// @downloadURL  ""
+// @updateURL    https://raw.githubusercontent.com/citizen-123/TornUserScripts/refs/heads/main/TornProfileStatsViewer.js
+// @downloadURL  https://raw.githubusercontent.com/citizen-123/TornUserScripts/refs/heads/main/TornProfileStatsViewer.js
 // ==/UserScript==
 
 (function () {
