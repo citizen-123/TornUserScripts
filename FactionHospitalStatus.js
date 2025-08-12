@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faction Hospital Status
 // @namespace    master.torn.hospital.details
-// @version      1.5.0
+// @version      1.5.1
 // @description  On faction profile pages, append a details row under members in Hospital using Torn v2 members API.
 // @author       VinPetrol [2060292]
 // @match        https://www.torn.com/factions.php*
@@ -419,7 +419,7 @@
       }
     },
     getVersion() {
-      return '1.4.0';
+      return '1.5.1';
     },
     getStoredKey() {
       const key = getStoredApiKey();
@@ -643,6 +643,7 @@
       const li = document.createElement('li');
       li.className = 'table-row hospital-extra-row';
       li.setAttribute('data-xid', xid);
+      li.setAttribute('data-hospital-details', 'true'); // Mark for easy identification
 
       // Cell 1: Time Left in Hospital
       const cell1 = document.createElement('div');
@@ -701,6 +702,9 @@
     }
 
     function isHospitalRow(row) {
+      // Skip if this is a hospital details row
+      if (row.classList.contains('hospital-extra-row')) return false;
+      
       // Prefer the last cell (Status column) if present
       const statusCell =
         row.querySelector('.table-cell.status') ||
@@ -758,6 +762,59 @@
     let processing = false;
     let timerInterval = null;
     let lastStatusSnapshot = new Map(); // Track last known statuses to detect changes
+    let lastProcessedRowOrder = []; // Track the order of player rows to detect sorting
+
+    // --- Table structure monitoring ---
+    function getCurrentRowOrder() {
+      const list = document.querySelector('ul.table-body') || document.querySelector('ul.faction-members .table-body');
+      if (!list) return [];
+
+      const rows = list.querySelectorAll(':scope > li.table-row:not(.hospital-extra-row)');
+      return Array.from(rows).map(row => getXIDFromRow(row)).filter(xid => xid !== null);
+    }
+
+    function hasTableBeenSorted() {
+      const currentOrder = getCurrentRowOrder();
+      const orderChanged = JSON.stringify(currentOrder) !== JSON.stringify(lastProcessedRowOrder);
+      if (orderChanged) {
+        console.log('[Faction Hospital Status] Table order changed - sorting detected');
+        lastProcessedRowOrder = [...currentOrder];
+      }
+      return orderChanged;
+    }
+
+    // --- Clean up orphaned hospital rows ---
+    function removeAllHospitalRows() {
+      const list = document.querySelector('ul.table-body') || document.querySelector('ul.faction-members .table-body');
+      if (!list) return;
+
+      const hospitalRows = list.querySelectorAll('.hospital-extra-row');
+      hospitalRows.forEach(row => {
+        console.log('[Faction Hospital Status] Removing hospital row for XID:', row.getAttribute('data-xid'));
+        row.remove();
+      });
+    }
+
+    function removeOrphanedHospitalRows() {
+      const list = document.querySelector('ul.table-body') || document.querySelector('ul.faction-members .table-body');
+      if (!list) return;
+
+      const hospitalRows = list.querySelectorAll('.hospital-extra-row');
+      hospitalRows.forEach(row => {
+        const xid = row.getAttribute('data-xid');
+        const prevRow = row.previousElementSibling;
+        
+        // Check if the previous row is the correct player row
+        const prevXid = prevRow ? getXIDFromRow(prevRow) : null;
+        const isCorrectlyPositioned = prevXid && prevXid.toString() === xid;
+        const isPrevRowHospital = prevRow ? isHospitalRow(prevRow) : false;
+        
+        if (!isCorrectlyPositioned || !isPrevRowHospital) {
+          console.log('[Faction Hospital Status] Removing orphaned hospital row for XID:', xid);
+          row.remove();
+        }
+      });
+    }
 
     // --- Real-time timer updates ---
     function updateTimers() {
@@ -871,11 +928,22 @@
           document.querySelector('ul.faction-members .table-body');
         if (!list) return;
 
-        const rows = list.querySelectorAll(':scope > li.table-row');
+        // Check if table has been sorted - if so, clean up all hospital rows first
+        if (hasTableBeenSorted()) {
+          console.log('[Faction Hospital Status] Sorting detected, cleaning up all hospital rows');
+          removeAllHospitalRows();
+        } else {
+          // Just clean up orphaned rows if no sorting detected
+          removeOrphanedHospitalRows();
+        }
+
+        const rows = list.querySelectorAll(':scope > li.table-row:not(.hospital-extra-row)');
         let hasHospitalRows = false;
 
         rows.forEach(row => {
           if (!isHospitalRow(row)) return;
+          
+          // Check if we already have a hospital row after this one
           if (hasInjectedRowAfter(row)) {
             // Update existing row
             const existingRow = row.nextElementSibling;
@@ -911,6 +979,7 @@
 
           row.insertAdjacentElement('afterend', infoRow);
           hasHospitalRows = true;
+          console.log(`[Faction Hospital Status] Added hospital details for XID ${xid}`);
         });
 
         // Start or stop timer updates based on whether we have hospital rows
@@ -930,11 +999,79 @@
       }
     }
 
-    const run = debounce(processTableOnce, 200);
-    run();
+    // Enhanced debouncing with special handling for sorting
+    function createSmartDebouncer() {
+      let normalTimeout = null;
+      let sortingTimeout = null;
+      let lastMutationTime = 0;
+      
+      return function(mutationRecords) {
+        const now = Date.now();
+        lastMutationTime = now;
+        
+        // Clear existing timeouts
+        clearTimeout(normalTimeout);
+        clearTimeout(sortingTimeout);
+        
+        // Check if this looks like a sorting operation (many DOM changes at once)
+        const hasMultipleChanges = mutationRecords && mutationRecords.length > 5;
+        const hasListChanges = mutationRecords && mutationRecords.some(record => 
+          record.type === 'childList' && 
+          (record.target.classList.contains('table-body') || 
+           record.target.querySelector('.table-body'))
+        );
+        
+        if (hasMultipleChanges || hasListChanges) {
+          console.log('[Faction Hospital Status] Detected potential sorting operation, using extended delay');
+          // Use longer delay for potential sorting operations
+          sortingTimeout = setTimeout(() => {
+            // Double-check that no more mutations happened recently
+            if (Date.now() - lastMutationTime >= 450) {
+              processTableOnce();
+            }
+          }, 500);
+        } else {
+          // Use normal delay for other changes
+          normalTimeout = setTimeout(processTableOnce, 150);
+        }
+      };
+    }
 
-    const observer = new MutationObserver(run);
-    observer.observe(document.body, { childList: true, subtree: true });
+    const smartRun = createSmartDebouncer();
+    
+    // Initial run
+    smartRun();
+
+    // Set up mutation observer with improved handling
+    const observer = new MutationObserver((mutationRecords) => {
+      // Filter out mutations that are just our own hospital row additions
+      const relevantMutations = mutationRecords.filter(record => {
+        if (record.type !== 'childList') return true;
+        
+        // Ignore mutations that are just our hospital rows being added/removed
+        const addedNodes = Array.from(record.addedNodes);
+        const removedNodes = Array.from(record.removedNodes);
+        
+        const isOurChanges = [...addedNodes, ...removedNodes].every(node => 
+          node.nodeType === Node.ELEMENT_NODE && 
+          node.classList && 
+          node.classList.contains('hospital-extra-row')
+        );
+        
+        return !isOurChanges;
+      });
+      
+      if (relevantMutations.length > 0) {
+        smartRun(relevantMutations);
+      }
+    });
+    
+    observer.observe(document.body, { 
+      childList: true, 
+      subtree: true,
+      attributes: false, // Don't watch attribute changes to reduce noise
+      characterData: false // Don't watch text changes to reduce noise
+    });
 
     // Periodic status change check (every 30 seconds)
     const statusCheckInterval = setInterval(checkForStatusChanges, 30000);
@@ -957,12 +1094,14 @@
             factionId = newFactionId;
             membersById = null; // reset cache for new faction
             lastStatusSnapshot.clear(); // reset status tracking
+            lastProcessedRowOrder = []; // reset row order tracking
           }
-          run();
+          smartRun();
         } else {
           // Not on faction profile page, stop timers
           stopTimerUpdates();
           lastStatusSnapshot.clear();
+          lastProcessedRowOrder = [];
         }
       }
     }, 500);
