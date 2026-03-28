@@ -18,7 +18,9 @@
 
   // --- CONFIG ---
   const API_BASE = 'https://api.torn.com/v2';
-  const XHR = (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? GM.xmlHttpRequest : GM_xmlhttpRequest;
+  const XHR = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
+    ? GM.xmlHttpRequest
+    : (typeof GM_xmlhttpRequest !== 'undefined' ? GM_xmlhttpRequest : null);
   const STORAGE_KEY = 'factionHospitalStatusApiKey_v1'; // Unique storage key
 
   // --- CUSTOM API KEY POPUP ---
@@ -445,7 +447,12 @@
   async function initialize() {
     try {
       console.log('[Faction Hospital Status] Starting initialization...');
-      
+
+      if (!XHR) {
+        console.error('[Faction Hospital Status] No GM.xmlHttpRequest or GM_xmlhttpRequest available. Script cannot run.');
+        return;
+      }
+
       // Wait for DOM to be ready
       await waitForDOMReady();
       
@@ -735,6 +742,17 @@
                 return reject(new Error(`API error ${res.status}: ${res.statusText}`));
               }
               const data = JSON.parse(res.responseText);
+              if (data && data.error) {
+                const errCode = data.error.code;
+                const errMsg = data.error.error || 'Unknown API error';
+                console.error(`[Torn Hospital Details] Torn API error code ${errCode}: ${errMsg}`);
+                // For invalid/incorrect key errors, clear stored key so user gets re-prompted
+                if (errCode === 1 || errCode === 2 || errCode === 10) {
+                  try { localStorage.removeItem(STORAGE_KEY); } catch(e) { /* ignore */ }
+                  API_KEY = null;
+                }
+                return reject(new Error(`Torn API error (code ${errCode}): ${errMsg}`));
+              }
               if (!data || !Array.isArray(data.members)) {
                 console.error('[Torn Hospital Details] Unexpected API payload:', data);
                 return reject(new Error('Unexpected API payload structure'));
@@ -763,6 +781,7 @@
     let timerInterval = null;
     let lastStatusSnapshot = new Map(); // Track last known statuses to detect changes
     let lastProcessedRowOrder = []; // Track the order of player rows to detect sorting
+    let releasedCheckTimeout = null; // Debounce for "Released" timer triggers
 
     // --- Table structure monitoring ---
     function getCurrentRowOrder() {
@@ -825,9 +844,12 @@
         if (timer.textContent !== newText) {
           timer.textContent = newText;
           
-          // If timer shows "Released", trigger a status check
-          if (newText === 'Released') {
-            setTimeout(() => checkForStatusChanges(), 1000);
+          // If timer shows "Released", trigger a debounced status check
+          if (newText === 'Released' && !releasedCheckTimeout) {
+            releasedCheckTimeout = setTimeout(() => {
+              releasedCheckTimeout = null;
+              checkForStatusChanges();
+            }, 1000);
           }
         }
       });
@@ -842,6 +864,10 @@
       if (timerInterval) {
         clearInterval(timerInterval);
         timerInterval = null;
+      }
+      if (releasedCheckTimeout) {
+        clearTimeout(releasedCheckTimeout);
+        releasedCheckTimeout = null;
       }
     }
 
@@ -898,16 +924,42 @@
 
     async function ensureMembersLoaded() {
       if (membersById) return;
-      
-      try {
-        console.log('[Faction Hospital Status] Fetching members data...');
-        const members = await fetchMembers(factionId);
-        membersById = new Map(members.map(m => [Number(m.id), m]));
-        console.log(`[Faction Hospital Status] Loaded ${membersById.size} members into cache`);
-      } catch (error) {
-        console.error('[Faction Hospital Status] Failed to load members:', error);
-        // Don't throw - let the script continue but log the error
-        // This allows the user to try again later or fix API key issues
+
+      const maxRetries = 3;
+      const baseDelay = 2000;
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          console.log(`[Faction Hospital Status] Fetching members data (attempt ${attempt}/${maxRetries})...`);
+          const members = await fetchMembers(factionId);
+          membersById = new Map(members.map(m => [Number(m.id), m]));
+          console.log(`[Faction Hospital Status] Loaded ${membersById.size} members into cache`);
+          return;
+        } catch (error) {
+          console.error(`[Faction Hospital Status] Attempt ${attempt} failed:`, error);
+
+          // Don't retry for auth errors — these won't resolve by retrying
+          if (error.message && error.message.includes('Torn API error')) {
+            break;
+          }
+
+          if (attempt < maxRetries) {
+            const delay = baseDelay * Math.pow(2, attempt - 1);
+            console.log(`[Faction Hospital Status] Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+      }
+
+      // All retries exhausted — show user-visible error
+      console.error('[Faction Hospital Status] Failed to load members after all retries');
+      const list = document.querySelector('ul.table-body') || document.querySelector('ul.faction-members .table-body');
+      if (list && !list.querySelector('.hospital-error-banner')) {
+        const banner = document.createElement('li');
+        banner.className = 'hospital-error-banner';
+        banner.style.cssText = 'padding:8px 12px;color:#d32f2f;background:#fff3f3;border:1px solid #d32f2f;margin:4px 0;font-size:12px;border-radius:4px;';
+        banner.textContent = '[Hospital Status] Failed to load data after multiple attempts. Will retry on next status change.';
+        list.prepend(banner);
       }
     }
 
@@ -915,8 +967,12 @@
       if (processing) return;
       processing = true;
       try {
+        // Clear any previous error banner
+        const existingBanner = document.querySelector('.hospital-error-banner');
+        if (existingBanner) existingBanner.remove();
+
         await ensureMembersLoaded();
-        
+
         // If we don't have members data, don't try to process
         if (!membersById) {
           console.warn('[Faction Hospital Status] No members data available, skipping processing');
@@ -1066,25 +1122,23 @@
       }
     });
     
-    observer.observe(document.body, { 
-      childList: true, 
-      subtree: true,
-      attributes: false, // Don't watch attribute changes to reduce noise
-      characterData: false // Don't watch text changes to reduce noise
-    });
+    const observerOptions = { childList: true, subtree: true, attributes: false, characterData: false };
+    observer.observe(document.body, observerOptions);
 
     // Periodic status change check (every 30 seconds)
-    const statusCheckInterval = setInterval(checkForStatusChanges, 30000);
+    let statusCheckInterval = setInterval(checkForStatusChanges, 30000);
 
     // Cleanup on page unload
     window.addEventListener('beforeunload', () => {
       stopTimerUpdates();
       clearInterval(statusCheckInterval);
+      clearInterval(urlCheckInterval);
+      observer.disconnect();
     });
 
     // React to SPA-like URL changes
     let lastHref = location.href;
-    setInterval(() => {
+    const urlCheckInterval = setInterval(() => {
       if (location.href !== lastHref) {
         lastHref = location.href;
         const newUrl = new URL(location.href);
@@ -1096,10 +1150,15 @@
             lastStatusSnapshot.clear(); // reset status tracking
             lastProcessedRowOrder = []; // reset row order tracking
           }
+          // Re-enable observer and periodic checks when back on faction page
+          observer.observe(document.body, observerOptions);
+          statusCheckInterval = setInterval(checkForStatusChanges, 30000);
           smartRun();
         } else {
-          // Not on faction profile page, stop timers
+          // Not on faction profile page, stop everything
           stopTimerUpdates();
+          clearInterval(statusCheckInterval);
+          observer.disconnect();
           lastStatusSnapshot.clear();
           lastProcessedRowOrder = [];
         }
