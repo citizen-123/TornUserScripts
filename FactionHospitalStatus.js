@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Faction Hospital Status
 // @namespace    master.torn.hospital.details
-// @version      1.5.1
+// @version      1.6.0
 // @description  On faction profile pages, append a details row under members in Hospital using Torn v2 members API.
 // @author       VinPetrol [2060292]
-// @match        https://www.torn.com/factions.php*
+// @match        https://www.torn.com/*
 // @run-at       document-idle
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
@@ -18,249 +18,270 @@
 
   // --- CONFIG ---
   const API_BASE = 'https://api.torn.com/v2';
+  const STORAGE_KEY = 'factionHospitalStatusApiKey_v1';
+  const SCRIPT_VERSION = '1.6.0';
+
+  // TornPDA injects the user's API key by replacing this placeholder at load time
+  const PDA_API_KEY = '###PDA-APIKEY###';
+  const IS_PDA = PDA_API_KEY !== '###PDA-APIKEY###';
+
+  // --- XHR with fetch fallback for TornPDA ---
+  function fetchFallback(opts) {
+    fetch(opts.url, {
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+      signal: AbortSignal.timeout(opts.timeout || 10000),
+    })
+      .then(async (res) => {
+        const text = await res.text();
+        if (opts.onload) opts.onload({ status: res.status, statusText: res.statusText, responseText: text });
+      })
+      .catch((err) => {
+        if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+          if (opts.ontimeout) opts.ontimeout();
+        } else {
+          if (opts.onerror) opts.onerror(err);
+        }
+      });
+  }
+
   const XHR = (typeof GM !== 'undefined' && GM.xmlHttpRequest)
     ? GM.xmlHttpRequest
-    : (typeof GM_xmlhttpRequest !== 'undefined' ? GM_xmlhttpRequest : null);
-  const STORAGE_KEY = 'factionHospitalStatusApiKey_v1'; // Unique storage key
+    : (typeof GM_xmlhttpRequest !== 'undefined' ? GM_xmlhttpRequest : fetchFallback);
 
-  // --- CUSTOM API KEY POPUP ---
-  function createApiKeyPopup() {
-    // Remove any existing popup
-    const existingPopup = document.getElementById('torn-hospital-api-popup');
-    if (existingPopup) {
-      existingPopup.remove();
+  // --- PROFILE PAGE SETTINGS PANEL ---
+  function getLoggedInUserXID() {
+    // Try sidebar/nav selectors that point to the logged-in user's profile
+    const selectors = [
+      '#sidebarroot a[class*="profileLink"]',
+      '#sidebar a[href*="/profiles.php?XID="]',
+      'a[class*="menu-value___"][href*="/profiles.php?XID="]',
+      '.settings-menu > .link > a[href*="/profiles.php?XID="]',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        const match = el.getAttribute('href')?.match(/XID=(\d+)/);
+        if (match) return match[1];
+      }
+    }
+    return null;
+  }
+
+  function injectSettingsPanel() {
+    if (IS_PDA) return; // Key is managed by TornPDA
+
+    const url = new URL(window.location.href);
+    if (url.pathname !== '/profiles.php') return;
+
+    const pageXID = url.searchParams.get('XID');
+    if (!pageXID) return;
+
+    const ownXID = getLoggedInUserXID();
+    if (!ownXID || ownXID !== pageXID) return;
+
+    // Don't inject twice
+    if (document.getElementById('fhs-settings-panel')) return;
+
+    const waitForProfile = () => {
+      const anchor = document.querySelector('.profile-wrapper') ||
+                     document.querySelector('.basic-information') ||
+                     document.querySelector('#profileroot');
+      if (anchor) {
+        const panel = createSettingsPanel();
+        anchor.parentNode.insertBefore(panel, anchor.nextSibling);
+      } else {
+        setTimeout(waitForProfile, 500);
+      }
+    };
+    waitForProfile();
+  }
+
+  function createSettingsPanel() {
+    const storedKey = getStoredApiKey() || '';
+
+    const details = document.createElement('details');
+    details.id = 'fhs-settings-panel';
+    details.className = 'fhs-settings-accordion';
+    if (!storedKey) details.open = true; // Auto-open if no key set
+
+    const summary = document.createElement('summary');
+    summary.className = 'fhs-settings-summary';
+    summary.textContent = `Faction Hospital Status v${SCRIPT_VERSION}`;
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'fhs-settings-body';
+    body.innerHTML = `
+      <p class="fhs-settings-desc">Enter your Torn API key to enable hospital status details on faction pages.
+        You can create one at <a href="/preferences.php#tab=api" target="_blank">Preferences &gt; API</a> with <strong>Public</strong> access.</p>
+      <div class="fhs-settings-row">
+        <label for="fhs-api-key-input">API Key:</label>
+        <input type="text" id="fhs-api-key-input" class="fhs-api-input fhs-blur"
+               placeholder="Paste your API key here..." value="${storedKey}" autocomplete="off" />
+        <button id="fhs-save-btn" class="fhs-btn fhs-btn-primary">Save</button>
+        <button id="fhs-clear-btn" class="fhs-btn fhs-btn-secondary">Clear</button>
+      </div>
+      <div id="fhs-settings-status" class="fhs-settings-status"></div>
+    `;
+    details.appendChild(body);
+
+    // Inject styles
+    if (!document.getElementById('fhs-settings-styles')) {
+      const style = document.createElement('style');
+      style.id = 'fhs-settings-styles';
+      style.textContent = `
+        .fhs-settings-accordion {
+          margin: 10px 0;
+          padding: 0;
+          background: #1a1a2e;
+          border: 1px solid #444;
+          border-radius: 5px;
+          color: #ddd;
+          font-family: Arial, sans-serif;
+          font-size: 13px;
+        }
+        .fhs-settings-summary {
+          padding: 10px 14px;
+          cursor: pointer;
+          font-weight: bold;
+          color: #fff;
+          user-select: none;
+        }
+        .fhs-settings-summary:hover {
+          background: rgba(255,255,255,0.05);
+        }
+        .fhs-settings-body {
+          padding: 0 14px 14px;
+        }
+        .fhs-settings-desc {
+          margin: 0 0 12px;
+          line-height: 1.5;
+        }
+        .fhs-settings-desc a {
+          color: #4CAF50;
+          text-decoration: none;
+        }
+        .fhs-settings-desc a:hover {
+          text-decoration: underline;
+        }
+        .fhs-settings-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .fhs-settings-row label {
+          font-weight: bold;
+          color: #fff;
+          white-space: nowrap;
+        }
+        .fhs-api-input {
+          flex: 1;
+          min-width: 180px;
+          padding: 7px 10px;
+          background: #333;
+          color: #fff;
+          border: 1px solid #555;
+          border-radius: 4px;
+          font-size: 13px;
+        }
+        .fhs-api-input:focus {
+          outline: none;
+          border-color: #4CAF50;
+          box-shadow: 0 0 4px rgba(76,175,80,0.3);
+        }
+        .fhs-api-input.fhs-blur {
+          filter: blur(3px);
+          transition: filter 0.3s;
+        }
+        .fhs-api-input.fhs-blur:focus {
+          filter: blur(0);
+        }
+        .fhs-btn {
+          padding: 7px 14px;
+          border: none;
+          border-radius: 4px;
+          cursor: pointer;
+          font-size: 13px;
+          transition: background-color 0.2s;
+        }
+        .fhs-btn-primary {
+          background: #4CAF50;
+          color: #fff;
+        }
+        .fhs-btn-primary:hover { background: #45a049; }
+        .fhs-btn-primary:disabled { background: #666; cursor: not-allowed; }
+        .fhs-btn-secondary {
+          background: #666;
+          color: #fff;
+        }
+        .fhs-btn-secondary:hover { background: #555; }
+        .fhs-settings-status {
+          margin-top: 8px;
+          padding: 0;
+          font-size: 13px;
+          border-radius: 4px;
+          display: none;
+        }
+        .fhs-settings-status.show {
+          display: block;
+          padding: 8px 10px;
+        }
+        .fhs-settings-status.success { background: #4CAF50; color: #fff; }
+        .fhs-settings-status.error { background: #f44336; color: #fff; }
+        .fhs-settings-status.loading { background: #2196F3; color: #fff; }
+        @media (max-width: 600px) {
+          .fhs-settings-row { flex-direction: column; align-items: stretch; }
+          .fhs-api-input { min-width: 0; }
+        }
+      `;
+      document.head.appendChild(style);
     }
 
-    const popup = document.createElement('div');
-    popup.id = 'torn-hospital-api-popup';
-    popup.innerHTML = `
-      <div class="torn-hospital-popup-overlay">
-        <div class="torn-hospital-popup-content">
-          <div class="torn-hospital-popup-header">
-            <h3>Faction Hospital Status - API Key Required</h3>
-          </div>
-          <div class="torn-hospital-popup-body">
-            <p>To show hospital details, please enter your Torn API key:</p>
-            <ol>
-              <li>Go to <a href="https://www.torn.com/preferences.php#tab=api" target="_blank">https://www.torn.com/preferences.php#tab=api</a></li>
-              <li>Create a new API key with <strong>"Public"</strong> access level</li>
-              <li>Copy and paste the key below</li>
-            </ol>
-            <div class="torn-hospital-input-group">
-              <label for="torn-hospital-api-input">API Key:</label>
-              <input type="text" id="torn-hospital-api-input" placeholder="Enter your API key here..." />
-            </div>
-            <div id="torn-hospital-popup-status" class="torn-hospital-status"></div>
-          </div>
-          <div class="torn-hospital-popup-footer">
-            <button id="torn-hospital-validate-btn" class="torn-hospital-btn torn-hospital-btn-primary">Validate & Save</button>
-            <button id="torn-hospital-cancel-btn" class="torn-hospital-btn torn-hospital-btn-secondary">Cancel</button>
-          </div>
-        </div>
-      </div>
-    `;
+    // Wire up events after insertion
+    setTimeout(() => {
+      const input = document.getElementById('fhs-api-key-input');
+      const saveBtn = document.getElementById('fhs-save-btn');
+      const clearBtn = document.getElementById('fhs-clear-btn');
+      const status = document.getElementById('fhs-settings-status');
 
-    // Add CSS styles
-    const style = document.createElement('style');
-    style.textContent = `
-      .torn-hospital-popup-overlay {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: rgba(0, 0, 0, 0.8);
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        z-index: 10000;
-        padding: 20px;
-        box-sizing: border-box;
+      function showStatus(msg, type) {
+        status.textContent = msg;
+        status.className = `fhs-settings-status show ${type}`;
       }
 
-      .torn-hospital-popup-content {
-        background: #2a2a2a;
-        border-radius: 8px;
-        max-width: 500px;
-        width: 100%;
-        max-height: 90vh;
-        overflow-y: auto;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
-        color: #ddd;
-        font-family: Arial, sans-serif;
-      }
+      saveBtn.addEventListener('click', async () => {
+        const key = input.value.trim();
+        if (!key) { showStatus('Please enter an API key.', 'error'); return; }
 
-      .torn-hospital-popup-header {
-        padding: 20px;
-        border-bottom: 1px solid #444;
-      }
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Validating...';
+        showStatus('Validating API key...', 'loading');
 
-      .torn-hospital-popup-header h3 {
-        margin: 0;
-        color: #fff;
-        font-size: 18px;
-      }
-
-      .torn-hospital-popup-body {
-        padding: 20px;
-      }
-
-      .torn-hospital-popup-body p {
-        margin: 0 0 15px 0;
-        line-height: 1.5;
-      }
-
-      .torn-hospital-popup-body ol {
-        margin: 0 0 20px 0;
-        padding-left: 20px;
-      }
-
-      .torn-hospital-popup-body li {
-        margin-bottom: 8px;
-        line-height: 1.4;
-      }
-
-      .torn-hospital-popup-body a {
-        color: #4CAF50;
-        text-decoration: none;
-      }
-
-      .torn-hospital-popup-body a:hover {
-        text-decoration: underline;
-      }
-
-      .torn-hospital-input-group {
-        margin: 20px 0;
-      }
-
-      .torn-hospital-input-group label {
-        display: block;
-        margin-bottom: 8px;
-        font-weight: bold;
-        color: #fff;
-      }
-
-      .torn-hospital-input-group input {
-        width: 100%;
-        padding: 12px;
-        border: 1px solid #555;
-        border-radius: 4px;
-        background: #333;
-        color: #fff;
-        font-size: 14px;
-        box-sizing: border-box;
-      }
-
-      .torn-hospital-input-group input:focus {
-        outline: none;
-        border-color: #4CAF50;
-        box-shadow: 0 0 5px rgba(76, 175, 80, 0.3);
-      }
-
-      .torn-hospital-status {
-        margin: 10px 0;
-        padding: 10px;
-        border-radius: 4px;
-        font-size: 14px;
-        text-align: center;
-        display: none;
-      }
-
-      .torn-hospital-status.show {
-        display: block;
-      }
-
-      .torn-hospital-status.success {
-        background: #4CAF50;
-        color: white;
-      }
-
-      .torn-hospital-status.error {
-        background: #f44336;
-        color: white;
-      }
-
-      .torn-hospital-status.loading {
-        background: #2196F3;
-        color: white;
-      }
-
-      .torn-hospital-popup-footer {
-        padding: 20px;
-        border-top: 1px solid #444;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-      }
-
-      .torn-hospital-btn {
-        padding: 10px 20px;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 14px;
-        transition: background-color 0.2s;
-        min-width: 100px;
-      }
-
-      .torn-hospital-btn-primary {
-        background: #4CAF50;
-        color: white;
-      }
-
-      .torn-hospital-btn-primary:hover {
-        background: #45a049;
-      }
-
-      .torn-hospital-btn-primary:disabled {
-        background: #666;
-        cursor: not-allowed;
-      }
-
-      .torn-hospital-btn-secondary {
-        background: #666;
-        color: white;
-      }
-
-      .torn-hospital-btn-secondary:hover {
-        background: #555;
-      }
-
-      /* Mobile styles */
-      @media (max-width: 768px) {
-        .torn-hospital-popup-overlay {
-          padding: 10px;
+        const valid = await validateApiKey(key);
+        if (valid) {
+          storeApiKey(key);
+          showStatus('API key saved! Hospital details will appear on faction pages.', 'success');
+        } else {
+          showStatus('Invalid API key. Check your key and try again.', 'error');
         }
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+      });
 
-        .torn-hospital-popup-content {
-          max-height: 95vh;
-        }
+      clearBtn.addEventListener('click', () => {
+        clearStoredApiKey();
+        input.value = '';
+        showStatus('API key cleared.', 'success');
+      });
 
-        .torn-hospital-popup-header,
-        .torn-hospital-popup-body,
-        .torn-hospital-popup-footer {
-          padding: 15px;
-        }
+      input.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') saveBtn.click();
+      });
+    }, 0);
 
-        .torn-hospital-popup-footer {
-          flex-direction: column;
-        }
-
-        .torn-hospital-btn {
-          width: 100%;
-          margin-bottom: 10px;
-        }
-
-        .torn-hospital-btn:last-child {
-          margin-bottom: 0;
-        }
-      }
-    `;
-
-    document.head.appendChild(style);
-    document.body.appendChild(popup);
-
-    return popup;
+    return details;
   }
 
   // --- API KEY MANAGEMENT ---
@@ -310,125 +331,28 @@
     });
   }
 
-  function showApiKeyPopup() {
-    return new Promise((resolve) => {
-      const popup = createApiKeyPopup();
-      const input = popup.querySelector('#torn-hospital-api-input');
-      const validateBtn = popup.querySelector('#torn-hospital-validate-btn');
-      const cancelBtn = popup.querySelector('#torn-hospital-cancel-btn');
-      const status = popup.querySelector('#torn-hospital-popup-status');
-
-      function showStatus(message, type) {
-        status.textContent = message;
-        status.className = `torn-hospital-status show ${type}`;
-      }
-
-      function hideStatus() {
-        status.className = 'torn-hospital-status';
-      }
-
-      async function validateAndSave() {
-        const apiKey = input.value.trim();
-        
-        if (!apiKey) {
-          showStatus('Please enter an API key', 'error');
-          return;
-        }
-
-        validateBtn.disabled = true;
-        validateBtn.textContent = 'Validating...';
-        showStatus('Validating API key, please wait...', 'loading');
-
-        const isValid = await validateApiKey(apiKey);
-
-        if (isValid) {
-          const stored = storeApiKey(apiKey);
-          if (stored) {
-            showStatus('API key validated and saved successfully!', 'success');
-            setTimeout(() => {
-              popup.remove();
-              resolve(apiKey);
-            }, 1500);
-          } else {
-            showStatus('Error saving API key. Please try again.', 'error');
-            validateBtn.disabled = false;
-            validateBtn.textContent = 'Validate & Save';
-          }
-        } else {
-          showStatus('Invalid API key. Please check and try again.', 'error');
-          validateBtn.disabled = false;
-          validateBtn.textContent = 'Validate & Save';
-        }
-      }
-
-      function cancel() {
-        popup.remove();
-        resolve(null);
-      }
-
-      validateBtn.addEventListener('click', validateAndSave);
-      cancelBtn.addEventListener('click', cancel);
-      
-      // Allow Enter key to validate
-      input.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-          validateAndSave();
-        }
-      });
-
-      // Focus the input
-      setTimeout(() => input.focus(), 100);
-    });
-  }
-
-  async function ensureApiKey() {
-    let apiKey = getStoredApiKey();
-    
-    if (!apiKey) {
-      console.log('[Faction Hospital Status] No API key found, showing popup...');
-      apiKey = await showApiKeyPopup();
-      
-      if (!apiKey) {
-        console.log('[Faction Hospital Status] No API key provided, script disabled.');
-        return null;
-      }
-    }
-    
-    return apiKey;
+  function ensureApiKey() {
+    if (IS_PDA) return PDA_API_KEY;
+    return getStoredApiKey();
   }
 
   // --- UTILITY FUNCTIONS FOR USERS ---
-  // Add global functions for API key management
   window.tornHospitalDetails = {
-    async resetApiKey() {
-      const confirmed = confirm('This will delete your stored API key and prompt you to enter a new one. Continue?');
+    resetApiKey() {
+      if (IS_PDA) { alert('API key is managed by TornPDA. Change it in the app settings.'); return; }
+      const confirmed = confirm('This will delete your stored API key. Continue?');
       if (confirmed) {
-        try {
-          clearStoredApiKey();
-          alert('API key cleared. Please refresh the page to enter a new one.');
-          location.reload();
-        } catch (e) {
-          console.error('[Faction Hospital Status] Error clearing API key:', e);
-          alert('Error clearing API key.');
-        }
-      }
-    },
-    async changeApiKey() {
-      const newKey = await showApiKeyPopup();
-      if (newKey) {
-        alert('API key updated successfully. Refreshing page...');
-        location.reload();
+        clearStoredApiKey();
+        alert('API key cleared. Visit your profile page to set a new one.');
       }
     },
     getVersion() {
-      return '1.5.1';
+      return SCRIPT_VERSION;
     },
     getStoredKey() {
+      if (IS_PDA) return 'Managed by TornPDA';
       const key = getStoredApiKey();
-      if (key) {
-        return key.substring(0, 8) + '...'; // Show only first 8 chars for security
-      }
-      return 'No key stored';
+      return key ? key.substring(0, 8) + '...' : 'No key stored';
     }
   };
 
@@ -443,47 +367,55 @@
     });
   }
 
+  // Show a non-intrusive banner on the faction page when no API key is configured
+  function showNoKeyBanner() {
+    const ownXID = getLoggedInUserXID();
+    const profileLink = ownXID ? `/profiles.php?XID=${ownXID}` : '/profiles.php';
+    const list = document.querySelector('ul.table-body') || document.querySelector('ul.faction-members .table-body');
+    if (list && !list.querySelector('.hospital-setup-banner')) {
+      const banner = document.createElement('li');
+      banner.className = 'hospital-setup-banner';
+      banner.style.cssText = 'padding:10px 12px;background:#1a1a2e;border:1px solid #444;margin:4px 0;border-radius:4px;font-size:13px;color:#ddd;';
+      banner.innerHTML = `<strong>[Hospital Status]</strong> API key not configured. <a href="${profileLink}" style="color:#4CAF50;">Go to your profile</a> to set it up.`;
+      list.prepend(banner);
+    }
+  }
+
   // Main initialization
   async function initialize() {
     try {
       console.log('[Faction Hospital Status] Starting initialization...');
 
-      if (!XHR) {
-        console.error('[Faction Hospital Status] No GM.xmlHttpRequest or GM_xmlhttpRequest available. Script cannot run.');
+      await waitForDOMReady();
+
+      const url = new URL(window.location.href);
+
+      // Profile page: inject settings panel for own profile
+      if (url.pathname === '/profiles.php') {
+        injectSettingsPanel();
         return;
       }
 
-      // Wait for DOM to be ready
-      await waitForDOMReady();
-      
-      // Check if we're on the right page
-      const url = new URL(window.location.href);
+      // Faction page: run hospital details
       if (url.pathname !== '/factions.php' || url.searchParams.get('step') !== 'profile') {
-        console.log('[Faction Hospital Status] Not on faction profile page, skipping');
         return;
       }
 
       const factionId = url.searchParams.get('ID');
-      if (!factionId) {
-        console.log('[Faction Hospital Status] No faction ID found, skipping');
-        return;
-      }
+      if (!factionId) return;
 
-      // Get API key
-      console.log('[Faction Hospital Status] Checking for API key...');
-      const apiKey = await ensureApiKey();
-      
+      const apiKey = ensureApiKey();
       if (!apiKey) {
-        console.warn('[Faction Hospital Status] No API key available, script disabled');
+        console.log('[Faction Hospital Status] No API key configured');
+        // Wait a moment for the member list to render, then show banner
+        setTimeout(showNoKeyBanner, 1000);
         return;
       }
 
       console.log('[Faction Hospital Status] API key found, initializing script...');
       API_KEY = apiKey;
-      
-      // Initialize the main script functionality
       initializeHospitalDetails(factionId);
-      
+
     } catch (error) {
       console.error('[Faction Hospital Status] Initialization error:', error);
     }
@@ -493,11 +425,6 @@
 
   function initializeHospitalDetails(factionId) {
     console.log('[Faction Hospital Status] Script loaded successfully');
-    console.log('[Faction Hospital Status] Available commands:');
-    console.log('  - tornHospitalDetails.changeApiKey()');
-    console.log('  - tornHospitalDetails.resetApiKey()');
-    console.log('  - tornHospitalDetails.getVersion()');
-    console.log('  - tornHospitalDetails.getStoredKey()');
     
     // Inject styles for responsive design
     injectStyles();
